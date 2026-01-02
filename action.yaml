@@ -1,0 +1,82 @@
+name: 'Check k8s flux reconciliation'
+description: 'Check if changes deployed to k8s have successfully reconciled'
+inputs:
+  service-name:
+    description: 'Name of service being deployed(Ex: dev-biscred-api)'
+    required: true
+  cluster:
+    description: 'k8s cluster being deployed to'
+    required: true
+  region:
+    description: 'AWS region'
+    required: false
+    default: 'us-east-1'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v5
+      with:
+        ref: flux-main
+
+    - name: Assume role for AWS Account
+      uses: bisnow/github-actions-assume-role-for-environment@main
+      with:
+        aws-account: "bisnow"
+
+    - name: Configure kubectl
+      run: |
+        aws eks update-kubeconfig --region ${{ inputs.region }} --name ${{ inputs.cluster}}
+      shell: bash
+
+    - name: Wait for Flux reconciliation
+      run: |
+        echo "Waiting for Flux to reconcile the deployment..."
+        timeout=300  # 5 minutes
+        interval=10
+        elapsed=0
+
+        echo "waiting for 30 seconds before checking for Flux reconciliation"
+        sleep 30
+
+        while [ $elapsed -lt $timeout ]; do
+          # Check if the Kustomization is ready
+          status=$(kubectl get kustomization ${{ inputs.service-name }} -n flux-system -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "Unknown")
+
+          # Get current git SHA from flux-main branch
+          current_git_sha=$(git rev-parse HEAD)
+          echo "Current git SHA: $current_git_sha"
+
+          # Get the SHA that Flux is currently using and extract just the SHA part
+          flux_revision=$(kubectl get kustomization ${{ inputs.service-name }} -n flux-system -o jsonpath='{.status.lastAppliedRevision}' 2>/dev/null || echo "Unknown")
+          flux_sha=$(echo "$flux_revision" | sed 's/.*@sha1://' || echo "Unknown")
+          echo "Flux revision: $flux_revision"
+          echo "Flux SHA: $flux_sha"
+
+          if [ "$status" = "True" ]; then
+            # Check if Flux is using the same SHA as our current commit
+            if [ "$flux_sha" = "$current_git_sha" ]; then
+              echo "✅ Flux reconciliation successful! SHA matches: $current_git_sha"
+              kubectl get kustomization ${{ inputs.service-name }} -n flux-system
+              exit 0
+            else
+              echo "⏳ Flux ready but using different SHA. Waiting for SHA to match... (${elapsed}s elapsed)"
+            fi
+          elif [ "$status" = "False" ]; then
+            echo "❌ Flux reconciliation failed!"
+            kubectl describe kustomization ${{ inputs.service-name }} -n flux-system
+            exit 1
+          else
+            echo "⏳ Flux still reconciling... (${elapsed}s elapsed)"
+          fi
+
+          sleep $interval
+          elapsed=$((elapsed + interval))
+        done
+
+        echo "⏰ Timeout waiting for Flux reconciliation"
+        kubectl describe kustomization ${{ inputs.service-name }} -n flux-system
+        exit 1
+      shell: bash
+
