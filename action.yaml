@@ -31,21 +31,24 @@ runs:
       shell: bash
 
     - name: Wait for Flux reconciliation
+      id: reconcile
       run: |
         echo "Waiting for Flux to reconcile the deployment..."
         timeout=300  # 5 minutes
         interval=10
         elapsed=0
 
-        echo "waiting for 30 seconds before checking for Flux reconciliation"
-        sleep 30
+        echo "waiting for 60 seconds before checking for Flux reconciliation to help prevent false negitives"
+        sleep 60
+
+        # Get current git SHA from flux-main branch (export for summary)
+        current_git_sha=$(git rev-parse HEAD)
+        echo "EXPECTED_SHA=$current_git_sha" >> $GITHUB_ENV
 
         while [ $elapsed -lt $timeout ]; do
           # Check if the Kustomization is ready
           status=$(kubectl get kustomization ${{ inputs.service-name }} -n flux-system -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "Unknown")
 
-          # Get current git SHA from flux-main branch
-          current_git_sha=$(git rev-parse HEAD)
           echo "Current git SHA: $current_git_sha"
 
           # Get the SHA that Flux is currently using and extract just the SHA part
@@ -54,18 +57,28 @@ runs:
           echo "Flux revision: $flux_revision"
           echo "Flux SHA: $flux_sha"
 
+          # Export for summary
+          echo "FLUX_SHA=$flux_sha" >> $GITHUB_ENV
+          echo "ELAPSED=${elapsed}s" >> $GITHUB_ENV
+
           if [ "$status" = "True" ]; then
             # Check if Flux is using the same SHA as our current commit
             if [ "$flux_sha" = "$current_git_sha" ]; then
               echo "✅ Flux reconciliation successful! SHA matches: $current_git_sha"
               kubectl get kustomization ${{ inputs.service-name }} -n flux-system
+              echo "RECONCILE_STATUS=success" >> $GITHUB_ENV
               exit 0
             else
               echo "⏳ Flux ready but using different SHA. Waiting for SHA to match... (${elapsed}s elapsed)"
             fi
           elif [ "$status" = "False" ]; then
             echo "❌ Flux reconciliation failed!"
-            kubectl describe kustomization ${{ inputs.service-name }} -n flux-system
+            error_output=$(kubectl describe kustomization ${{ inputs.service-name }} -n flux-system 2>&1)
+            echo "$error_output"
+            echo "RECONCILE_STATUS=failed" >> $GITHUB_ENV
+            echo "ERROR_OUTPUT<<EOF" >> $GITHUB_ENV
+            echo "$error_output" >> $GITHUB_ENV
+            echo "EOF" >> $GITHUB_ENV
             exit 1
           else
             echo "⏳ Flux still reconciling... (${elapsed}s elapsed)"
@@ -76,7 +89,53 @@ runs:
         done
 
         echo "⏰ Timeout waiting for Flux reconciliation"
-        kubectl describe kustomization ${{ inputs.service-name }} -n flux-system
+        error_output=$(kubectl describe kustomization ${{ inputs.service-name }} -n flux-system 2>&1)
+        echo "$error_output"
+        echo "RECONCILE_STATUS=timeout" >> $GITHUB_ENV
+        echo "ERROR_OUTPUT<<EOF" >> $GITHUB_ENV
+        echo "$error_output" >> $GITHUB_ENV
+        echo "EOF" >> $GITHUB_ENV
         exit 1
       shell: bash
+
+    - name: Write job summary
+      if: always()
+      shell: bash
+      run: |
+        if [ "${{ steps.reconcile.outcome }}" = "success" ]; then
+          STATUS_TEXT="Reconciled"
+        elif [ "$RECONCILE_STATUS" = "timeout" ]; then
+          STATUS_TEXT="Timeout"
+        else
+          STATUS_TEXT="Failed"
+        fi
+
+        cat >> $GITHUB_STEP_SUMMARY << EOF
+        ## Flux Reconciliation
+
+        | Field | Value |
+        |-------|-------|
+        | Service | \`${{ inputs.service-name }}\` |
+        | Cluster | \`${{ inputs.cluster }}\` |
+        | Expected SHA | \`${EXPECTED_SHA:-unknown}\` |
+        | Flux SHA | \`${FLUX_SHA:-unknown}\` |
+        | Duration | \`${ELAPSED:-unknown}\` |
+        | Status | ${STATUS_TEXT} |
+        EOF
+
+        if [ "${{ steps.reconcile.outcome }}" != "success" ] && [ -n "$ERROR_OUTPUT" ]; then
+          cat >> $GITHUB_STEP_SUMMARY << 'EOF'
+
+        <details>
+        <summary>Kustomization Details</summary>
+
+        ```
+        EOF
+          echo "$ERROR_OUTPUT" >> $GITHUB_STEP_SUMMARY
+          cat >> $GITHUB_STEP_SUMMARY << 'EOF'
+        ```
+
+        </details>
+        EOF
+        fi
 
