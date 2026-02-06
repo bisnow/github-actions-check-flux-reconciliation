@@ -68,3 +68,12 @@ jobs:
    - The Kustomization status is "Ready"
    - Flux is using the same Git SHA as the flux-main branch
 6. Exits successfully when reconciliation is complete, or fails with diagnostics if there's an issue
+
+## Versioning
+
+This action uses rolling major version tags. You can pin to:
+
+- A specific version: `@v3.1.0` (exact, never changes)
+- A major version: `@v3` (recommended, gets bug fixes and new features)
+
+When a new semantic version tag (e.g., `v3.2.0`) is pushed, a GitHub Actions workflow automatically updates the corresponding major version tag (`v3`) to point to the new release.
