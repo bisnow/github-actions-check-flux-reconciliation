@@ -16,7 +16,12 @@ inputs:
     required: false
   environment:
     description: 'GitHub environment name for deployment tracking (e.g. production, staging)'
-    required: true
+    required: false
+    default: ''
+  environment-url:
+    description: 'URL to link from the GitHub deployment status (e.g. https://myapp.non-prod.bisnow.cloud)'
+    required: false
+    default: ''
 
 runs:
   using: 'composite'
@@ -27,13 +32,18 @@ runs:
       env:
         GH_TOKEN: ${{ inputs.github-token || github.token }}
       run: |
-        deployment=$(gh api repos/${{ github.repository }}/deployments \
-          --method POST \
-          -f ref="${{ github.sha }}" \
-          -f environment="${{ inputs.environment }}" \
-          -f description="Deploying ${{ inputs.service-name }}" \
-          -F auto_merge=false \
-          -F required_contexts='[]')
+        ENVIRONMENT="${{ inputs.environment }}"
+        if [ -z "$ENVIRONMENT" ]; then
+          ENVIRONMENT="${{ inputs.service-name }}"
+        fi
+
+        deployment=$(echo '{
+          "ref": "${{ github.sha }}",
+          "environment": "'"$ENVIRONMENT"'",
+          "description": "Deploying ${{ inputs.service-name }}",
+          "auto_merge": false,
+          "required_contexts": []
+        }' | gh api repos/${{ github.repository }}/deployments --method POST --input -)
 
         deployment_id=$(echo "$deployment" | jq -r '.id')
         echo "DEPLOYMENT_ID=$deployment_id" >> $GITHUB_ENV
@@ -147,10 +157,16 @@ runs:
           DEPLOY_DESC="Flux reconciliation failed"
         fi
 
-        gh api repos/${{ github.repository }}/deployments/$DEPLOYMENT_ID/statuses \
+        ENVIRONMENT_URL="${{ inputs.environment-url }}"
+        STATUS_BODY="{\"state\":\"$DEPLOY_STATE\",\"description\":\"$DEPLOY_DESC\""
+        if [ -n "$ENVIRONMENT_URL" ]; then
+          STATUS_BODY="$STATUS_BODY,\"environment_url\":\"$ENVIRONMENT_URL\""
+        fi
+        STATUS_BODY="$STATUS_BODY}"
+
+        echo "$STATUS_BODY" | gh api repos/${{ github.repository }}/deployments/$DEPLOYMENT_ID/statuses \
           --method POST \
-          -f state="$DEPLOY_STATE" \
-          -f description="$DEPLOY_DESC"
+          --input -
 
         cat >> $GITHUB_STEP_SUMMARY << EOF
         ## Flux Reconciliation
