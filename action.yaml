@@ -72,14 +72,19 @@ runs:
               echo "⏳ Flux ready but using different SHA. Waiting for SHA to match... (${elapsed}s elapsed)"
             fi
           elif [ "$status" = "False" ]; then
-            echo "❌ Flux reconciliation failed!"
-            error_output=$(kubectl describe kustomization ${{ inputs.service-name }} -n flux-system 2>&1)
-            echo "$error_output"
-            echo "RECONCILE_STATUS=failed" >> $GITHUB_ENV
-            echo "ERROR_OUTPUT<<EOF" >> $GITHUB_ENV
-            echo "$error_output" >> $GITHUB_ENV
-            echo "EOF" >> $GITHUB_ENV
-            exit 1
+            reason=$(kubectl get kustomization ${{ inputs.service-name }} -n flux-system -o jsonpath='{.status.conditions[?(@.type=="Ready")].reason}' 2>/dev/null || echo "Unknown")
+            if [ "$reason" = "DependencyNotReady" ]; then
+              echo "⏳ Dependency not ready, continuing to wait... (${elapsed}s elapsed)"
+            else
+              echo "❌ Flux reconciliation failed! Reason: $reason"
+              error_output=$(kubectl describe kustomization "${{ inputs.service-name }}" -n flux-system 2>&1)
+              echo "$error_output"
+              echo "RECONCILE_STATUS=failed" >> $GITHUB_ENV
+              echo "ERROR_OUTPUT<<EOF" >> $GITHUB_ENV
+              echo "$error_output" >> $GITHUB_ENV
+              echo "EOF" >> $GITHUB_ENV
+              exit 1
+            fi
           else
             echo "⏳ Flux still reconciling... (${elapsed}s elapsed)"
           fi
