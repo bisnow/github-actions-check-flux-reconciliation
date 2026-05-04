@@ -8,7 +8,7 @@ This action waits for Flux to reconcile your deployment and verifies that:
 1. The Kustomization is in a "Ready" state
 2. Flux is using the correct Git SHA from your flux-main branch
 
-If Flux reconciliation fails or times out after 5 minutes, the action will fail and provide detailed diagnostic information.
+If Flux reconciliation fails or times out after 5 minutes, the action will fail and provide detailed diagnostic information including the specific failure reason. A job summary is written with reconciliation status, expected and actual SHAs, and duration.
 
 ## Usage
 
@@ -63,11 +63,13 @@ jobs:
 1. Checks out the `flux-main` branch
 2. Assumes AWS role for the Bisnow account
 3. Configures kubectl for your EKS cluster
-4. Waits up to 5 minutes for Flux to reconcile
-5. Checks every 10 seconds to see if:
+4. Waits 60 seconds before polling to help prevent false negatives
+5. Polls every 10 seconds (up to 5 minutes) to check if:
    - The Kustomization status is "Ready"
    - Flux is using the same Git SHA as the flux-main branch
-6. Exits successfully when reconciliation is complete, or fails with diagnostics if there's an issue
+6. Handles intermediate states gracefully — if a dependency is not ready (`DependencyNotReady`), continues waiting instead of failing immediately
+7. On failure, reports the specific failure reason and full Kustomization details
+8. Writes a GitHub Actions job summary with reconciliation status, SHAs, and duration
 
 ## Versioning
 
