@@ -77,7 +77,7 @@ runs:
               echo "⏳ Dependency not ready, continuing to wait... (${elapsed}s elapsed)"
             else
               echo "❌ Flux reconciliation failed! Reason: $reason"
-              error_output=$(kubectl describe kustomization ${{ inputs.service-name }} -n flux-system 2>&1)
+              error_output=$(kubectl describe kustomization "${{ inputs.service-name }}" -n flux-system 2>&1)
               echo "$error_output"
               echo "RECONCILE_STATUS=failed" >> $GITHUB_ENV
               echo "ERROR_OUTPUT<<EOF" >> $GITHUB_ENV
