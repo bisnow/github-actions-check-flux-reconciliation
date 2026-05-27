@@ -46,35 +46,40 @@ runs:
         echo "EXPECTED_SHA=$current_git_sha" >> $GITHUB_ENV
 
         while [ $elapsed -lt $timeout ]; do
-          # Check if the Kustomization is ready
-          status=$(kubectl get kustomization ${{ inputs.service-name }} -n flux-system -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "Unknown")
+          # Fetch status/reason/revision in a single snapshot to avoid races
+          # where state changes between separate kubectl calls.
+          ready_json=$(kubectl get kustomization ${{ inputs.service-name }} -n flux-system -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}|{.status.conditions[?(@.type=="Ready")].reason}|{.status.lastAppliedRevision}' 2>/dev/null || echo "Unknown|Unknown|Unknown")
+          status=$(echo "$ready_json" | cut -d'|' -f1)
+          reason=$(echo "$ready_json" | cut -d'|' -f2)
+          flux_revision=$(echo "$ready_json" | cut -d'|' -f3)
+          flux_sha=$(echo "$flux_revision" | sed 's/.*@sha1://')
+          [ -z "$status" ] && status="Unknown"
+          [ -z "$reason" ] && reason="Unknown"
 
           echo "Current git SHA: $current_git_sha"
-
-          # Get the SHA that Flux is currently using and extract just the SHA part
-          flux_revision=$(kubectl get kustomization ${{ inputs.service-name }} -n flux-system -o jsonpath='{.status.lastAppliedRevision}' 2>/dev/null || echo "Unknown")
-          flux_sha=$(echo "$flux_revision" | sed 's/.*@sha1://' || echo "Unknown")
           echo "Flux revision: $flux_revision"
           echo "Flux SHA: $flux_sha"
+          echo "Ready status: $status (reason: $reason)"
 
           # Export for summary
           echo "FLUX_SHA=$flux_sha" >> $GITHUB_ENV
           echo "ELAPSED=${elapsed}s" >> $GITHUB_ENV
 
+          # Success path: SHA matches AND last reconcile succeeded.
+          # We check reason rather than just status=True because Ready can
+          # momentarily flip to False mid-reconcile even on a healthy deploy.
+          if [ "$flux_sha" = "$current_git_sha" ] && [ "$reason" = "ReconciliationSucceeded" ]; then
+            echo "✅ Flux reconciliation successful! SHA matches: $current_git_sha"
+            kubectl get kustomization ${{ inputs.service-name }} -n flux-system
+            echo "RECONCILE_STATUS=success" >> $GITHUB_ENV
+            exit 0
+          fi
+
           if [ "$status" = "True" ]; then
-            # Check if Flux is using the same SHA as our current commit
-            if [ "$flux_sha" = "$current_git_sha" ]; then
-              echo "✅ Flux reconciliation successful! SHA matches: $current_git_sha"
-              kubectl get kustomization ${{ inputs.service-name }} -n flux-system
-              echo "RECONCILE_STATUS=success" >> $GITHUB_ENV
-              exit 0
-            else
-              echo "⏳ Flux ready but using different SHA. Waiting for SHA to match... (${elapsed}s elapsed)"
-            fi
+            echo "⏳ Flux ready but using different SHA. Waiting for SHA to match... (${elapsed}s elapsed)"
           elif [ "$status" = "False" ]; then
-            reason=$(kubectl get kustomization ${{ inputs.service-name }} -n flux-system -o jsonpath='{.status.conditions[?(@.type=="Ready")].reason}' 2>/dev/null || echo "Unknown")
-            if [ "$reason" = "DependencyNotReady" ]; then
-              echo "⏳ Dependency not ready, continuing to wait... (${elapsed}s elapsed)"
+            if [ "$reason" = "DependencyNotReady" ] || [ "$reason" = "Progressing" ] || [ "$reason" = "ReconciliationSucceeded" ]; then
+              echo "⏳ Not ready yet ($reason), continuing to wait... (${elapsed}s elapsed)"
             else
               echo "❌ Flux reconciliation failed! Reason: $reason"
               error_output=$(kubectl describe kustomization "${{ inputs.service-name }}" -n flux-system 2>&1)
