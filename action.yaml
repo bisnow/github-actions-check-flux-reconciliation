@@ -11,6 +11,14 @@ inputs:
     description: 'AWS region'
     required: false
     default: 'us-east-1'
+  timeout:
+    description: >-
+      Seconds to keep polling for the deploy SHA to reconcile before giving up.
+      Raise this for services whose rollout (migrations + serial pod rollout)
+      routinely runs longer than the Kustomization's own healthCheck timeout,
+      which transiently reports HealthCheckFailed mid-deploy.
+    required: false
+    default: '300'
 
 runs:
   using: 'composite'
@@ -34,9 +42,10 @@ runs:
       id: reconcile
       run: |
         echo "Waiting for Flux to reconcile the deployment..."
-        timeout=300  # 5 minutes
+        timeout=${{ inputs.timeout }}
         interval=10
         elapsed=0
+        echo "Poll timeout: ${timeout}s"
 
         echo "waiting for 60 seconds before checking for Flux reconciliation to help prevent false negitives"
         sleep 60
@@ -78,7 +87,15 @@ runs:
           if [ "$status" = "True" ]; then
             echo "⏳ Flux ready but using different SHA. Waiting for SHA to match... (${elapsed}s elapsed)"
           elif [ "$status" = "False" ]; then
-            if [ "$reason" = "DependencyNotReady" ] || [ "$reason" = "Progressing" ] || [ "$reason" = "ReconciliationSucceeded" ]; then
+            # HealthCheckFailed is transient during a normal deploy: Flux's
+            # Kustomization gives up its own healthCheck (typically 2m) while the
+            # HelmRelease is still rolling (migrations + serial pod rollout), then
+            # retries and recovers on its next reconcile. Wait it out within our
+            # own $timeout rather than failing the deploy on that false negative.
+            # A genuinely broken deploy stays HealthCheckFailed and is caught when
+            # $timeout expires below. Other reasons (e.g. apply/build errors) are
+            # terminal and still fail fast.
+            if [ "$reason" = "DependencyNotReady" ] || [ "$reason" = "Progressing" ] || [ "$reason" = "ReconciliationSucceeded" ] || [ "$reason" = "HealthCheckFailed" ]; then
               echo "⏳ Not ready yet ($reason), continuing to wait... (${elapsed}s elapsed)"
             else
               echo "❌ Flux reconciliation failed! Reason: $reason"
