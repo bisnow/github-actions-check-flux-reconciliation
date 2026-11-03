@@ -19,6 +19,14 @@ inputs:
       which transiently reports HealthCheckFailed mid-deploy.
     required: false
     default: '300'
+  dependency-timeout:
+    description: >-
+      Extra seconds, on top of timeout, to keep waiting while the Kustomization
+      reports DependencyNotReady (another Kustomization it dependsOn, e.g.
+      kyverno-policies, is not Ready yet). Time spent DependencyNotReady does
+      not count against timeout, up to this many seconds. Set to 0 to disable.
+    required: false
+    default: '300'
 
 runs:
   using: 'composite'
@@ -43,9 +51,16 @@ runs:
       run: |
         echo "Waiting for Flux to reconcile the deployment..."
         timeout=${{ inputs.timeout }}
+        dependency_timeout=${{ inputs.dependency-timeout }}
         interval=10
         elapsed=0
-        echo "Poll timeout: ${timeout}s"
+        # Seconds spent DependencyNotReady; added to the deadline, capped at
+        # $dependency_timeout, so waiting on a dependency doesn't use up $timeout.
+        dependency_wait=0
+        # Last Flux SHA we looked up in flux-main history (see below), so we
+        # fetch at most once per new revision rather than on every poll.
+        checked_flux_sha=""
+        echo "Poll timeout: ${timeout}s (+ up to ${dependency_timeout}s while DependencyNotReady)"
 
         echo "waiting for 60 seconds before checking for Flux reconciliation to help prevent false negitives"
         sleep 60
@@ -54,13 +69,13 @@ runs:
         current_git_sha=$(git rev-parse HEAD)
         echo "EXPECTED_SHA=$current_git_sha" >> $GITHUB_ENV
 
-        while [ $elapsed -lt $timeout ]; do
-          # Fetch status/reason/revision in a single snapshot to avoid races
-          # where state changes between separate kubectl calls.
-          ready_json=$(kubectl get kustomization ${{ inputs.service-name }} -n flux-system -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}|{.status.conditions[?(@.type=="Ready")].reason}|{.status.lastAppliedRevision}' 2>/dev/null || echo "Unknown|Unknown|Unknown")
-          status=$(echo "$ready_json" | cut -d'|' -f1)
-          reason=$(echo "$ready_json" | cut -d'|' -f2)
-          flux_revision=$(echo "$ready_json" | cut -d'|' -f3)
+        while [ $elapsed -lt $((timeout + dependency_wait)) ]; do
+          # Fetch status/reason/revision/message in a single snapshot to avoid
+          # races where state changes between separate kubectl calls. The
+          # message goes last and `read` takes only the first line, so a
+          # multi-line or '|'-containing message can't shift the other fields.
+          ready_json=$(kubectl get kustomization ${{ inputs.service-name }} -n flux-system -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}|{.status.conditions[?(@.type=="Ready")].reason}|{.status.lastAppliedRevision}|{.status.conditions[?(@.type=="Ready")].message}' 2>/dev/null || echo "Unknown|Unknown|Unknown|")
+          IFS='|' read -r status reason flux_revision ready_message <<< "$ready_json"
           flux_sha=$(echo "$flux_revision" | sed 's/.*@sha1://')
           [ -z "$status" ] && status="Unknown"
           [ -z "$reason" ] && reason="Unknown"
@@ -82,6 +97,42 @@ runs:
             kubectl get kustomization ${{ inputs.service-name }} -n flux-system
             echo "RECONCILE_STATUS=success" >> $GITHUB_ENV
             exit 0
+          fi
+
+          # Overtaken by a newer commit: another deploy can land on flux-main
+          # right after ours, and Flux then applies that newer commit instead,
+          # so the exact SHA match above never happens. If the applied revision
+          # has ours in its history, our change is live. The checkout is
+          # shallow, so fetch more flux-main history when the applied SHA isn't
+          # local yet; do this once per new Flux SHA, not on every poll.
+          if [ "$reason" = "ReconciliationSucceeded" ] && [ "$flux_sha" != "$current_git_sha" ] && [ "$flux_sha" != "$checked_flux_sha" ] && [[ "$flux_sha" =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]]; then
+            if git cat-file -e "${flux_sha}^{commit}" 2>/dev/null || git fetch -q --deepen=50 origin flux-main; then
+              checked_flux_sha=$flux_sha
+              if ! git cat-file -e "${flux_sha}^{commit}" 2>/dev/null; then
+                echo "Flux SHA $flux_sha is not in the fetched flux-main history; continuing to wait for $current_git_sha"
+              elif git merge-base --is-ancestor "$current_git_sha" "$flux_sha"; then
+                echo "✅ Flux reconciliation successful! Flux applied a newer revision $flux_sha that contains $current_git_sha"
+                kubectl get kustomization ${{ inputs.service-name }} -n flux-system
+                echo "RECONCILE_STATUS=success" >> "$GITHUB_ENV"
+                echo "reconciled-via=newer-revision" >> "$GITHUB_OUTPUT"
+                exit 0
+              else
+                echo "Flux SHA $flux_sha does not contain $current_git_sha; continuing to wait"
+              fi
+            else
+              echo "⚠️ Could not fetch flux-main history to check $flux_sha; will retry on the next poll"
+            fi
+          fi
+
+          # DependencyNotReady: a Kustomization we dependsOn (e.g. kyverno-policies)
+          # isn't Ready, so ours hasn't started. Don't let that wait use up
+          # $timeout: push the deadline out by the time spent here, capped at
+          # $dependency_timeout in total.
+          if [ "$reason" = "DependencyNotReady" ]; then
+            dependency_message=$ready_message
+            dependency_wait=$((dependency_wait + interval))
+            [ $dependency_wait -gt $dependency_timeout ] && dependency_wait=$dependency_timeout
+            echo "Waiting on dependency: ${ready_message} (${dependency_wait}s of ${dependency_timeout}s dependency allowance used)"
           fi
 
           if [ "$status" = "True" ]; then
@@ -115,7 +166,15 @@ runs:
           elapsed=$((elapsed + interval))
         done
 
-        echo "⏰ Timeout waiting for Flux reconciliation"
+        if [ "${reason:-}" = "DependencyNotReady" ]; then
+          # e.g. "dependency 'flux-system/kyverno-policies' is not ready"
+          dependency=$(echo "$dependency_message" | sed -n "s/.*dependency '\([^']*\)'.*/\1/p")
+          [ -z "$dependency" ] && dependency=${dependency_message:-unknown}
+          echo "⏰ Timeout waiting for Flux reconciliation: held up by dependency ${dependency}, still not ready after ${elapsed}s (${dependency_wait}s past the ${timeout}s timeout). Message: ${dependency_message}"
+          echo "blocked-by=$dependency" >> "$GITHUB_OUTPUT"
+        else
+          echo "⏰ Timeout waiting for Flux reconciliation"
+        fi
         error_output=$(kubectl describe kustomization ${{ inputs.service-name }} -n flux-system 2>&1)
         echo "$error_output"
         echo "RECONCILE_STATUS=timeout" >> $GITHUB_ENV
@@ -128,11 +187,20 @@ runs:
     - name: Write job summary
       if: always()
       shell: bash
+      env:
+        RECONCILED_VIA: ${{ steps.reconcile.outputs.reconciled-via }}
+        BLOCKED_BY: ${{ steps.reconcile.outputs.blocked-by }}
       run: |
         if [ "${{ steps.reconcile.outcome }}" = "success" ]; then
           STATUS_TEXT="Reconciled"
+          if [ "$RECONCILED_VIA" = "newer-revision" ]; then
+            STATUS_TEXT="Reconciled (Flux applied a newer flux-main revision that contains the expected SHA)"
+          fi
         elif [ "$RECONCILE_STATUS" = "timeout" ]; then
           STATUS_TEXT="Timeout"
+          if [ -n "$BLOCKED_BY" ]; then
+            STATUS_TEXT="Timeout (dependency \`${BLOCKED_BY}\` not ready)"
+          fi
         else
           STATUS_TEXT="Failed"
         fi
